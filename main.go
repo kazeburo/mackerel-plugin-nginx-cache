@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"os"
-	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	mp "github.com/mackerelio/go-mackerel-plugin-helper"
+	"golang.org/x/time/rate"
 )
 
 type NginxCachePlugin struct {
@@ -20,12 +25,14 @@ type NginxCachePlugin struct {
 }
 
 var (
-	duResultPat  *regexp.Regexp
 	usageUnitPat *regexp.Regexp
 )
 
+const (
+	statPerSec = 100000 // 1秒あたりのstat回数
+)
+
 func init() {
-	duResultPat = regexp.MustCompile("^(\\d+)")
 	usageUnitPat = regexp.MustCompile("m$")
 }
 
@@ -33,23 +40,41 @@ func buildTempfilePath(path string) string {
 	return fmt.Sprintf("/tmp/mackerel-plugin-nginx-cache-%s", strings.Replace(path, "/", "-", -1))
 }
 
+func diskUsage(ctx context.Context, limiter *rate.Limiter, dir string, maxDepth, depth int) (int64, error) {
+	usage := int64(0)
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return usage, err
+	}
+
+	for _, file := range files {
+		if err := limiter.Wait(ctx); err != nil {
+			return usage, err
+		}
+		if file.IsDir() {
+			dirUsage, err := diskUsage(ctx, limiter, filepath.Join(dir, file.Name()), maxDepth, depth+1)
+			if err != nil {
+				return usage, err
+			}
+			usage += dirUsage
+		} else {
+			if statt, ok := file.Sys().(*syscall.Stat_t); ok {
+				usage += int64(statt.Blksize)
+			}
+		}
+	}
+	return usage, nil
+}
+
 func (n NginxCachePlugin) FetchMetrics() (map[string]interface{}, error) {
-	cmd := exec.Command("du", "-sm", n.ProxyCachePath)
-	out, err := cmd.Output()
+	ctx := context.Background()
+	r := rate.Every(time.Second / statPerSec)
+	limiter := rate.NewLimiter(r, statPerSec)
+	usageByte, err := diskUsage(ctx, limiter, n.ProxyCachePath, 10, 0)
 	if err != nil {
 		return nil, err
 	}
-
-	matches := duResultPat.FindStringSubmatch(string(out))
-
-	if len(matches) < 2 {
-		return nil, fmt.Errorf("\"%s\" is not matched the supposed result pattern", out)
-	}
-
-	usage, err := strconv.ParseUint(matches[1], 0, 64)
-	if err != nil {
-		return nil, err
-	}
+	usage := uint64(float64(usageByte) / (1024 * 1024))
 
 	stat := make(map[string]interface{})
 	stat["size"] = n.ProxyCacheSize
