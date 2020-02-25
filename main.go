@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,11 +41,15 @@ func buildTempfilePath(path string) string {
 
 func diskUsage(ctx context.Context, limiter *rate.Limiter, dir string, maxDepth, depth int) (int64, error) {
 	usage := int64(0)
-	files, err := ioutil.ReadDir(dir)
+	d, err := os.Open(dir)
 	if err != nil {
 		return usage, err
 	}
-
+	defer d.Close()
+	files, err := d.Readdir(-1)
+	if err != nil {
+		return usage, err
+	}
 	for _, file := range files {
 		if err := limiter.Wait(ctx); err != nil {
 			return usage, err
@@ -68,8 +71,9 @@ func diskUsage(ctx context.Context, limiter *rate.Limiter, dir string, maxDepth,
 
 func (n NginxCachePlugin) FetchMetrics() (map[string]interface{}, error) {
 	ctx := context.Background()
-	r := rate.Every(time.Second / statPerSec)
+	r := rate.Limit(statPerSec)
 	limiter := rate.NewLimiter(r, statPerSec)
+	limiter.AllowN(time.Now(), statPerSec)
 	usageByte, err := diskUsage(ctx, limiter, n.ProxyCachePath, 10, 0)
 	if err != nil {
 		return nil, err
